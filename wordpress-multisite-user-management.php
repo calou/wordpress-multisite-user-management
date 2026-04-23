@@ -11,6 +11,41 @@
 
 defined( 'ABSPATH' ) || exit;
 
+// ---------------------------------------------------------------------------
+// AJAX user search (used by the autocomplete on the admin page)
+// ---------------------------------------------------------------------------
+
+add_action( 'wp_ajax_wsmum_search_users', 'wsmum_ajax_search_users' );
+function wsmum_ajax_search_users() {
+	if ( ! current_user_can( 'manage_network_users' ) ) {
+		wp_send_json_error( 'Forbidden', 403 );
+	}
+
+	check_ajax_referer( 'wsmum_search_users' );
+
+	$term = isset( $_GET['term'] ) ? sanitize_text_field( wp_unslash( $_GET['term'] ) ) : '';
+	if ( strlen( $term ) < 2 ) {
+		wp_send_json_success( [] );
+	}
+
+	$users = get_users( [
+		'blog_id'        => 0,
+		'search'         => '*' . $term . '*',
+		'search_columns' => [ 'user_login', 'user_email', 'display_name' ],
+		'number'         => 10,
+		'orderby'        => 'display_name',
+	] );
+
+	$results = array_map( function( $u ) {
+		return [
+			'id'    => $u->ID,
+			'label' => $u->display_name . ' (' . $u->user_login . ')',
+		];
+	}, $users );
+
+	wp_send_json_success( $results );
+}
+
 add_action( 'network_admin_menu', 'wsmum_add_menu' );
 function wsmum_add_menu() {
 	add_menu_page(
@@ -106,7 +141,6 @@ function wsmum_render_page() {
 	// If a user is pre-selected via query var (e.g. after redirect), honour it.
 	$selected_user_id = isset( $_GET['wsmum_uid'] ) ? absint( $_GET['wsmum_uid'] ) : 0;
 
-	$all_users = get_users( [ 'blog_id' => 0, 'number' => -1, 'orderby' => 'display_name', 'order' => 'ASC' ] );
 	$all_sites = get_sites( [ 'number' => 0 ] );
 	$all_roles = wp_roles()->roles;
 
@@ -125,27 +159,137 @@ function wsmum_render_page() {
 	<div class="wrap">
 		<h1><?php esc_html_e( 'User Site Roles', 'wsmum' ); ?></h1>
 
-		<!-- Step 1 – pick a user -->
-		<form method="get" action="<?php echo esc_url( network_admin_url( 'admin.php' ) ); ?>">
+		<!-- Step 1 – pick a user via autocomplete -->
+		<form method="get" id="wsmum-user-form" action="<?php echo esc_url( network_admin_url( 'admin.php' ) ); ?>">
 			<input type="hidden" name="page" value="wsmum-user-site-roles">
+			<input type="hidden" name="wsmum_uid" id="wsmum_uid" value="<?php echo esc_attr( $selected_user_id ); ?>">
 			<table class="form-table" role="presentation">
 				<tr>
-					<th scope="row"><label for="wsmum_uid"><?php esc_html_e( 'Select user', 'wsmum' ); ?></label></th>
+					<th scope="row"><label for="wsmum_user_search"><?php esc_html_e( 'Search user', 'wsmum' ); ?></label></th>
 					<td>
-						<select name="wsmum_uid" id="wsmum_uid">
-							<option value=""><?php esc_html_e( '— choose a user —', 'wsmum' ); ?></option>
-							<?php foreach ( $all_users as $u ) : ?>
-								<option value="<?php echo esc_attr( $u->ID ); ?>"
-									<?php selected( $selected_user_id, $u->ID ); ?>>
-									<?php echo esc_html( $u->display_name . ' (' . $u->user_login . ')' ); ?>
-								</option>
-							<?php endforeach; ?>
-						</select>
-						<?php submit_button( __( 'Load user', 'wsmum' ), 'secondary', '', false ); ?>
+						<div style="position:relative;display:inline-block;">
+							<input type="text" id="wsmum_user_search" autocomplete="off"
+								class="regular-text"
+								placeholder="<?php esc_attr_e( 'Type a name, login or email…', 'wsmum' ); ?>"
+								value="<?php
+									if ( $selected_user_id ) {
+										$u = get_userdata( $selected_user_id );
+										echo $u ? esc_attr( $u->display_name . ' (' . $u->user_login . ')' ) : '';
+									}
+								?>">
+							<ul id="wsmum-suggestions" style="
+								display:none;position:absolute;top:100%;left:0;
+								z-index:9999;background:#fff;border:1px solid #c3c4c7;
+								box-shadow:0 2px 6px rgba(0,0,0,.15);margin:0;padding:0;
+								min-width:100%;list-style:none;max-height:240px;overflow-y:auto;
+							"></ul>
+						</div>
+						<p class="description" style="margin-top:4px;">
+							<?php esc_html_e( 'Select a suggestion to load the user.', 'wsmum' ); ?>
+						</p>
 					</td>
 				</tr>
 			</table>
 		</form>
+
+		<style>
+		#wsmum-suggestions li {
+			padding: 6px 12px;
+			cursor: pointer;
+			white-space: nowrap;
+		}
+		#wsmum-suggestions li:hover,
+		#wsmum-suggestions li.wsmum-active {
+			background: #2271b1;
+			color: #fff;
+		}
+		</style>
+
+		<script>
+		(function() {
+			var searchInput = document.getElementById('wsmum_user_search');
+			var hiddenInput = document.getElementById('wsmum_uid');
+			var list        = document.getElementById('wsmum-suggestions');
+			var form        = document.getElementById('wsmum-user-form');
+			var ajaxUrl     = <?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>;
+			var nonce       = <?php echo wp_json_encode( wp_create_nonce( 'wsmum_search_users' ) ); ?>;
+			var activeIndex = -1;
+			var timer;
+
+			searchInput.addEventListener('input', function() {
+				clearTimeout(timer);
+				var term = this.value.trim();
+				if (term.length < 2) { closeList(); return; }
+				timer = setTimeout(function() { fetchUsers(term); }, 250);
+			});
+
+			searchInput.addEventListener('keydown', function(e) {
+				var items = list.querySelectorAll('li');
+				if (!items.length) return;
+				if (e.key === 'ArrowDown') {
+					e.preventDefault();
+					activeIndex = Math.min(activeIndex + 1, items.length - 1);
+					highlight(items);
+				} else if (e.key === 'ArrowUp') {
+					e.preventDefault();
+					activeIndex = Math.max(activeIndex - 1, 0);
+					highlight(items);
+				} else if (e.key === 'Enter') {
+					e.preventDefault();
+					if (activeIndex >= 0) items[activeIndex].click();
+				} else if (e.key === 'Escape') {
+					closeList();
+				}
+			});
+
+			document.addEventListener('click', function(e) {
+				if (e.target !== searchInput) closeList();
+			});
+
+			function fetchUsers(term) {
+				var url = ajaxUrl + '?action=wsmum_search_users&_ajax_nonce=' + encodeURIComponent(nonce)
+					+ '&term=' + encodeURIComponent(term);
+				fetch(url, { credentials: 'same-origin' })
+					.then(function(r) { return r.json(); })
+					.then(function(data) {
+						if (!data.success) return;
+						renderList(data.data);
+					});
+			}
+
+			function renderList(users) {
+				list.innerHTML = '';
+				activeIndex = -1;
+				if (!users.length) { closeList(); return; }
+				users.forEach(function(u) {
+					var li = document.createElement('li');
+					li.textContent = u.label;
+					li.dataset.id  = u.id;
+					li.addEventListener('click', function() {
+						searchInput.value = u.label;
+						hiddenInput.value = u.id;
+						closeList();
+						form.submit();
+					});
+					list.appendChild(li);
+				});
+				list.style.display = 'block';
+			}
+
+			function highlight(items) {
+				items.forEach(function(li, i) {
+					li.classList.toggle('wsmum-active', i === activeIndex);
+				});
+				if (activeIndex >= 0) items[activeIndex].scrollIntoView({ block: 'nearest' });
+			}
+
+			function closeList() {
+				list.style.display = 'none';
+				list.innerHTML = '';
+				activeIndex = -1;
+			}
+		})();
+		</script>
 
 		<?php if ( $selected_user_id && get_userdata( $selected_user_id ) ) :
 			$target = get_userdata( $selected_user_id );
